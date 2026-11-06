@@ -1723,8 +1723,7 @@ impl Host {
                         .reliable_data_in_transit
                         .saturating_sub(cmd.packet_data_len as u32);
                 }
-                cmd.round_trip_timeout =
-                    std::cmp::min(cmd.round_trip_timeout * 2, self.peers[i].timeout_maximum);
+                cmd.round_trip_timeout = self.peers[i].retransmit_timeout(cmd.send_attempts);
                 self.peers[i].outgoing_commands.push_front(cmd);
 
                 tracing::debug!(peer_id = i, "retransmitting timed-out reliable command");
@@ -1922,11 +1921,8 @@ impl Host {
 
                 if needs_ack {
                     if cmd.round_trip_timeout == 0 {
-                        cmd.round_trip_timeout = std::cmp::max(
-                            self.peers[peer_idx].round_trip_time
-                                + 4 * self.peers[peer_idx].round_trip_time_variance,
-                            self.peers[peer_idx].timeout_minimum,
-                        );
+                        cmd.round_trip_timeout =
+                            self.peers[peer_idx].retransmit_timeout(cmd.send_attempts);
                     }
                     if cmd.packet_data_len > 0 {
                         self.peers[peer_idx].reliable_data_in_transit += cmd.packet_data_len as u32;
