@@ -1,5 +1,7 @@
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use tokio::net::UdpSocket;
 use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -189,5 +191,103 @@ async fn disconnect_event() {
     assert!(
         matches!(&event, Some(Event::Disconnect { data: 99, .. })),
         "expected Disconnect event with data=99, got {event:?}"
+    );
+}
+
+/// A UDP relay between a client and `server` that drops the first datagram from the server
+/// carrying `marker`, as one lost Wi-Fi frame would. Returns the address clients connect to.
+async fn relay_losing_once(server: SocketAddr, marker: &'static [u8]) -> SocketAddr {
+    let client_side = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_side = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    server_side.connect(server).await.unwrap();
+    let relay = client_side.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut client = None;
+        let mut dropped = false;
+        let mut from_client = [0u8; 2048];
+        let mut from_server = [0u8; 2048];
+        loop {
+            tokio::select! {
+                Ok((length, address)) = client_side.recv_from(&mut from_client) => {
+                    client = Some(address);
+                    let _ = server_side.send(&from_client[..length]).await;
+                }
+                Ok(length) = server_side.recv(&mut from_server) => {
+                    let datagram = &from_server[..length];
+                    if !dropped && datagram.windows(marker.len()).any(|window| window == marker) {
+                        dropped = true;
+                        continue;
+                    }
+                    if let Some(client) = client {
+                        let _ = client_side.send_to(datagram, client).await;
+                    }
+                }
+            }
+        }
+    });
+    relay
+}
+
+/// A lost reliable packet is resent after about one round trip, as C ENet does
+/// (`RTT + min(RTT, 4·variance)`), not after the 5 s `timeout_minimum`.
+#[tokio::test]
+async fn lost_reliable_packet_is_resent_after_about_one_round_trip() {
+    let server_config = HostConfig {
+        address: Some("127.0.0.1:0".parse().unwrap()),
+        peer_count: 1,
+        channel_limit: 1,
+        ..Default::default()
+    };
+    let mut server = Host::new(server_config).unwrap();
+    let relay = relay_losing_once(server.local_addr().unwrap(), b"lost once").await;
+
+    let client_config = HostConfig {
+        peer_count: 1,
+        channel_limit: 1,
+        ..Default::default()
+    };
+    let mut client = Host::new(client_config).unwrap();
+    client.connect(relay, 1, 0).unwrap();
+    client.flush().await.unwrap();
+    poll_expect_none(&mut server, Duration::from_millis(200)).await;
+    let event = poll_until(&mut client, |e| matches!(e, Event::Connect { .. })).await;
+    assert!(event.is_some(), "expected Connect event on client");
+    client.flush().await.unwrap();
+    let Some(Event::Connect { peer_id, .. }) =
+        poll_until(&mut server, |e| matches!(e, Event::Connect { .. })).await
+    else {
+        panic!("expected Connect event on server");
+    };
+
+    // The server measures the round trip from acknowledged packets; it starts at 500 ms.
+    for _ in 0..50 {
+        let warm_up = Packet::new(b"warm up", PacketMode::ReliableSequenced);
+        server.peer_mut(peer_id).unwrap().send(0, warm_up).unwrap();
+        server.flush().await.unwrap();
+        let event = poll_until(&mut client, |e| matches!(e, Event::Receive { .. })).await;
+        assert!(event.is_some(), "expected the warm-up packet on the client");
+        client.flush().await.unwrap();
+        server.service(Duration::from_millis(5)).await.unwrap();
+    }
+    let round_trip = server.peer(peer_id).unwrap().round_trip_time();
+    assert!(round_trip < 50, "loopback round trip {round_trip} ms");
+
+    let lost = Packet::new(b"lost once", PacketMode::ReliableSequenced);
+    server.peer_mut(peer_id).unwrap().send(0, lost).unwrap();
+    server.flush().await.unwrap();
+    let sent = Instant::now();
+    let resent = loop {
+        assert!(sent.elapsed() < Duration::from_secs(10), "never resent");
+        server.service(Duration::from_millis(1)).await.unwrap();
+        if let Some(Event::Receive { packet, .. }) =
+            client.service(Duration::from_millis(1)).await.unwrap()
+            && packet.data() == b"lost once"
+        {
+            break sent.elapsed();
+        }
+    };
+    assert!(
+        resent < Duration::from_millis(250),
+        "resent after {resent:?} with a {round_trip} ms round trip"
     );
 }
