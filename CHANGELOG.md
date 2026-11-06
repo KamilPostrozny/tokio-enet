@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A reliable command's resend timeout now follows C ENet (`protocol.c`): one round trip plus the smaller of another round trip and four times the round-trip variance (the variance taken as at least 1 ms), capped at `timeout_maximum / 5` and multiplied by the send attempts so far (up to `timeout_limit`). It is no longer floored at `timeout_minimum` (5 s by default), so a lost reliable packet is resent after about one round trip instead of holding its channel for 5 s. The disconnect rule is unchanged.
+
 ## [0.1.1] - 2026-06-14
 
 ### Added

@@ -1,4 +1,6 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
@@ -195,15 +197,20 @@ async fn disconnect_event() {
 }
 
 /// A UDP relay between a client and `server` that drops the first datagram from the server
-/// carrying `marker`, as one lost Wi-Fi frame would. Returns the address clients connect to.
-async fn relay_losing_once(server: SocketAddr, marker: &'static [u8]) -> SocketAddr {
+/// carrying `marker`, as one lost Wi-Fi frame would. Returns the address clients connect to and
+/// the number of datagrams the relay has dropped.
+async fn relay_losing_once(
+    server: SocketAddr,
+    marker: &'static [u8],
+) -> (SocketAddr, Arc<AtomicUsize>) {
     let client_side = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let server_side = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     server_side.connect(server).await.unwrap();
     let relay = client_side.local_addr().unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::clone(&dropped);
     tokio::spawn(async move {
         let mut client = None;
-        let mut dropped = false;
         let mut from_client = [0u8; 2048];
         let mut from_server = [0u8; 2048];
         loop {
@@ -214,8 +221,10 @@ async fn relay_losing_once(server: SocketAddr, marker: &'static [u8]) -> SocketA
                 }
                 Ok(length) = server_side.recv(&mut from_server) => {
                     let datagram = &from_server[..length];
-                    if !dropped && datagram.windows(marker.len()).any(|window| window == marker) {
-                        dropped = true;
+                    if drops.load(Ordering::SeqCst) == 0
+                        && datagram.windows(marker.len()).any(|window| window == marker)
+                    {
+                        drops.fetch_add(1, Ordering::SeqCst);
                         continue;
                     }
                     if let Some(client) = client {
@@ -225,7 +234,7 @@ async fn relay_losing_once(server: SocketAddr, marker: &'static [u8]) -> SocketA
             }
         }
     });
-    relay
+    (relay, dropped)
 }
 
 /// A lost reliable packet is resent after about one round trip, as C ENet does
@@ -239,7 +248,7 @@ async fn lost_reliable_packet_is_resent_after_about_one_round_trip() {
         ..Default::default()
     };
     let mut server = Host::new(server_config).unwrap();
-    let relay = relay_losing_once(server.local_addr().unwrap(), b"lost once").await;
+    let (relay, dropped) = relay_losing_once(server.local_addr().unwrap(), b"lost once").await;
 
     let client_config = HostConfig {
         peer_count: 1,
@@ -286,6 +295,11 @@ async fn lost_reliable_packet_is_resent_after_about_one_round_trip() {
             break sent.elapsed();
         }
     };
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "the relay never dropped the first \"lost once\" datagram"
+    );
     assert!(
         resent < Duration::from_millis(250),
         "resent after {resent:?} with a {round_trip} ms round trip"
