@@ -709,8 +709,12 @@ impl Peer {
     /// How long a reliable command sent `send_attempts` times waits for its acknowledgement
     /// before it is resent, as C ENet in moonlight-common-c computes it: one round trip plus the
     /// smaller of another round trip and four variances (at most a fifth of `timeout_maximum`),
-    /// times the attempts so far, up to `timeout_limit` of them. `timeout_minimum` only bounds
-    /// the disconnect, so one lost packet holds its channel for about one round trip, not 5 s.
+    /// times the attempts so far, up to `timeout_limit` of them, so one lost packet holds its
+    /// channel for about one round trip, not 5 s. `timeout_minimum` plays no part here; it only
+    /// enters `Host`'s disconnect rule, whose backoff clause waits `timeout_minimum` times
+    /// 2^attempts only once 2^attempts reaches `timeout_minimum` (at least 7 h at the default
+    /// 5 s). In practice `timeout_maximum` (30 s by default) decides the disconnect: the peer
+    /// times out once its oldest reliable command has gone that long unacknowledged.
     pub(crate) fn retransmit_timeout(&self, send_attempts: u16) -> u32 {
         let variance = self.round_trip_time_variance.max(1).saturating_mul(4);
         let timeout = self.round_trip_time + self.round_trip_time.min(variance);
